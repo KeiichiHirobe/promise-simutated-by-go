@@ -30,19 +30,7 @@ const (
 )
 
 type Thenable interface {
-	Then(resolve func(interface{}), reject func(interface{})) *Promise
-}
-
-// RejectedError represents error which is returned by Then, and result will be recognized as rejected.
-type RejectedError interface {
-	IsRejected() bool
-}
-
-func isRejectedResult(result interface{}) bool {
-	if err, ok := result.(RejectedError); ok && err.IsRejected() {
-		return true
-	}
-	return false
+	Then(resolve func(interface{}), reject func(interface{}))
 }
 
 type Promise struct {
@@ -53,191 +41,164 @@ type Promise struct {
 	result interface{}
 }
 
-func ResolvedPromise(result interface{}) *Promise {
-	return &Promise{
-		state:  FULFILLED,
-		result: result,
+var closedChan = func() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
+
+/*
+promiseオブジェクトを受け取った場合
+受け取ったpromiseオブジェクトをそのまま返す
+
+thenableなオブジェクトを受け取った場合
+then をもつオブジェクトを新たなpromiseオブジェクトにして返す
+
+その他の値(オブジェクトやnull等も含む)を受け取った場合
+その値でresolveされる新たなpromiseオブジェクトを作り返す
+*/
+
+func Resolved(result interface{}) *Promise {
+	if promise, ok := result.(*Promise); ok {
+		return promise
+	} else if thenable, ok := result.(Thenable); ok {
+		return NewPromise(
+			func(resolve func(interface{}), reject func(interface{})) {
+				thenable.Then(resolve, reject)
+			},
+		)
+	} else {
+		return &Promise{
+			done:   closedChan,
+			state:  FULFILLED,
+			result: result,
+		}
 	}
 }
 
-func RejectedPromise(result interface{}) *Promise {
+/*
+受け取った値でrejectされた新たなpromiseオブジェクトを返す。
+Promise.rejectに渡す値は Error オブジェクトとすべきである。
+また、Promise.resolveとは異なり、promiseオブジェクトを渡した場合も常に新たなpromiseオブジェクトを作成する。
+*/
+
+func Rejected(result interface{}) *Promise {
 	return &Promise{
+		done:   closedChan,
 		state:  REJECT,
 		result: result,
 	}
 }
 
-func promiseFrom(result interface{}) *Promise {
-	if promise, ok := result.(*Promise); ok {
-		return promise
-	}
-	/*
-		if thenable, ok := result.(Thenable); ok {
-			return thenable.Then()
-		}
-	*/
-	if isRejectedResult(result) {
-		return RejectedPromise(result)
-	} else {
-		return ResolvedPromise(result)
-	}
-}
-
 func NewPromise(task func(resolve func(interface{}), reject func(interface{}))) *Promise {
-
 	p := &Promise{
 		state: PENDING,
 		done:  make(chan struct{}),
 	}
-	// ここでgo が必要かは確認
-	go task(
+	task(
 		func(result interface{}) {
-			p.ResolveWith(result)
+			p.resolveWith(result)
 		},
 		func(result interface{}) {
-			p.RejectWith(result)
+			p.rejectWith(result)
 		},
 	)
 	return p
 }
 
-func (p *Promise) ResolveWith(result interface{}) {
-	p.mu.Lock()
-	p.result = result
-	p.state = FULFILLED
-	p.mu.Unlock()
-	close(p.done)
-}
-
-func (p *Promise) RejectWith(result interface{}) {
-	p.mu.Lock()
-	p.result = result
-	p.state = REJECT
-	p.mu.Unlock()
-	close(p.done)
-}
-
-func (p *Promise) State() State {
+func (p *Promise) resolveWith(result interface{}) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.state
+	if p.state != PENDING {
+		return
+	}
+	p.result = result
+	p.state = FULFILLED
+	close(p.done)
+}
+
+func (p *Promise) rejectWith(result interface{}) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.state != PENDING {
+		return
+	}
+	p.result = result
+	p.state = REJECT
+	close(p.done)
 }
 
 // Then calls resolve/reject when promise has been settled.
 // resolve/reject may be nil. If nil, do nothing and throw to next Then.
-func (p *Promise) Then(resolve func(interface{}) interface{}, reject func(interface{}) interface{}) *Promise {
-	p.mu.Lock()
-	state := p.state
-	p.mu.Unlock()
-	switch state {
-	case PENDING:
-	case FULFILLED:
-		if resolve == nil {
-			return ResolvedPromise(p.result)
-		} else {
-			return promiseFrom(resolve(p.result))
-		}
-	case REJECT:
-		if reject == nil {
-			return RejectedPromise(p.result)
-		} else {
-			return promiseFrom(reject(p.result))
-		}
-	}
-
+func (p *Promise) Then(onFulfilled func(interface{}) interface{}, onRejected func(interface{}) interface{}) *Promise {
 	rp := &Promise{
 		state: PENDING,
 		done:  make(chan struct{}),
 	}
-
+	// settled でも必ず非同期に実行する
 	go func() {
 		<-p.done
 		var result interface{}
+		// no need to lock here, because promise p is read only after done
 		switch p.state {
 		case PENDING:
 			panic("bug")
 		case FULFILLED:
-			if resolve == nil {
+			if onFulfilled == nil {
 				result = p.result
 			} else {
-				result = resolve(p.result)
+				result = onFulfilled(p.result)
 			}
 		case REJECT:
-			if reject == nil {
+			if onRejected == nil {
 				result = p.result
 			} else {
-				result = reject(p.result)
+				result = onRejected(p.result)
 			}
 		}
+		resultPromise := Resolved(result)
+		<-resultPromise.done
 
+		// Then内でreturnされたpromiseは、promise自身でなく、その解決された値が渡される
 		if promise, ok := result.(*Promise); ok {
-			_ = promise.Then(
-				func(result interface{}) interface{} {
-					rp.ResolveWith(result)
-					return nil
-				},
-				func(result interface{}) interface{} {
-					rp.RejectWith(result)
-					return nil
-				},
-			)
-			return
+			result = promise.result
 		}
-
-		/*
-			if thenable, ok := value.(Thenable); ok {
-				return &Promise{}
-			}
-		*/
-
-		if isRejectedResult(result) {
-			rp.RejectWith(result)
-		} else {
-			rp.ResolveWith(result)
+		switch resultPromise.state {
+		case PENDING:
+			panic("bug")
+		case FULFILLED:
+			rp.resolveWith(result)
+		case REJECT:
+			rp.rejectWith(result)
 		}
 	}()
-
 	return rp
 }
 
-/*
-new Promise(function(resolve, reject) {
-
-  setTimeout(() => resolve(1), 1000);
-
-}).then(function(result) {
-
-  alert(result); // 1
-
-  return new Promise((resolve, reject) => { // (*)
-    setTimeout(() => resolve(result * 2), 1000);
-  });
-
-}).then(function(result) { // (**)
-
-  alert(result); // 2
-
-  return new Promise((resolve, reject) => {
-    setTimeout(() => resolve(result * 2), 1000);
-  });
-
-}).then(function(result) {
-
-  alert(result); // 4
-
-});
-
-*/
+func (p *Promise) Finally(onFinally func()) *Promise {
+	return p.Then(
+		func(result interface{}) interface{} {
+			onFinally()
+			return result
+		},
+		func(result interface{}) interface{} {
+			onFinally()
+			return Rejected(result)
+		},
+	)
+}
 
 func main() {
 	var done = make(chan struct{})
 	NewPromise(
 		func(resolve func(interface{}), reject func(interface{})) {
-			time.Sleep(1 * time.Second)
+			time.Sleep(3 * time.Second)
 			resolve(1)
+			fmt.Println("1================================")
 		},
 	).Then(
 		func(i interface{}) interface{} {
+			fmt.Println("2================================")
 			fmt.Println(i)
 			return NewPromise(
 				func(resolve func(interface{}), reject func(interface{})) {
@@ -249,6 +210,7 @@ func main() {
 		nil,
 	).Then(
 		func(i interface{}) interface{} {
+			fmt.Println("3================================")
 			fmt.Println(i)
 			return NewPromise(
 				func(resolve func(interface{}), reject func(interface{})) {
@@ -272,6 +234,6 @@ func main() {
 		},
 		nil,
 	)
-
+	fmt.Println("=====================")
 	<-done
 }
